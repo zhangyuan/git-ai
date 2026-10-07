@@ -1,0 +1,27 @@
+src/streams/model_extraction.rs
+  s_9a0fdd048ad3ad::t_0e699440ec9eff 1060-1061
+  s_9a0fdd048ad3ad::t_80f441da27a912 991-1017,1034,1039-1059
+  s_9a0fdd048ad3ad::t_61082fe12da425 1497-1533
+src/commands/checkpoint_agent/presets/opencode.rs
+  s_9a0fdd048ad3ad::t_b85f708901cf67 531-578
+  s_9a0fdd048ad3ad::t_8608aff8dbf0d6 157,159,165-173
+src/mdm/agents/opencode.rs
+  s_9a0fdd048ad3ad::t_15833e4a56b22a 302-308,311-313
+  s_9a0fdd048ad3ad::t_b51da454dc5e50 309-310
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "91582c32f7db3939c97666d913735b65d9512b3c",
+  "prompts": {},
+  "sessions": {
+    "s_9a0fdd048ad3ad": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_ee903134affeclG42cRO75of4J",
+        "model": "unknown"
+      },
+      "human_author": null
+    }
+  }
+}
