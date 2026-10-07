@@ -988,9 +988,33 @@ fn extract_model_from_opencode_sqlite(
         Err(_) => return Ok(None),
     };
 
-    // OpenCode stores model info in two places depending on message role:
-    //   User messages:     data.model.modelID  (nested object)
-    //   Assistant messages: data.modelID        (top-level string)
+    // OpenCode V2 moved messages to `session_message` (FK to `session_v2`) and
+    // stores the model as `data.model.id`. Older OpenCode versions store
+    // messages in `message` with `data.model.modelID` (user) or `data.modelID`
+    // (assistant). Try the V2 shape first, then fall back to V1.
+    let (v2_query, v2_params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match session_id {
+        Some(sid) => (
+            "SELECT data FROM session_message WHERE session_id = ? AND type = 'assistant' AND (data LIKE '%\"model\"%' OR data LIKE '%\"modelID\"%') ORDER BY seq ASC LIMIT 1",
+            vec![Box::new(sid.to_string())],
+        ),
+        None => (
+            "SELECT data FROM session_message WHERE type = 'assistant' AND (data LIKE '%\"model\"%' OR data LIKE '%\"modelID\"%') ORDER BY seq ASC LIMIT 1",
+            vec![],
+        ),
+    };
+
+    let v2_result: Option<String> = conn
+        .query_row(v2_query, rusqlite::params_from_iter(v2_params.iter()), |row| {
+            row.get::<_, String>(0)
+        })
+        .ok()
+        .and_then(|data| parse_opencode_model(&data));
+
+    if v2_result.is_some() {
+        return Ok(v2_result);
+    }
+
+    // V1 fallback: messages live in `message`.
     let (query, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match session_id {
         Some(sid) => (
             "SELECT data FROM message WHERE session_id = ? AND (data LIKE '%\"modelID\"%' OR data LIKE '%\"model\"%') LIMIT 1",
@@ -1007,23 +1031,32 @@ fn extract_model_from_opencode_sqlite(
             row.get::<_, String>(0)
         })
         .ok()
-        .and_then(|data| {
-            let json: serde_json::Value = serde_json::from_str(&data).ok()?;
-            // Try user message format: data.model.modelID
-            if let Some(model) = json
-                .get("model")
-                .and_then(|m| m.get("modelID"))
-                .and_then(|v| v.as_str())
-            {
-                return Some(model.to_string());
-            }
-            // Try assistant message format: data.modelID
-            json.get("modelID")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-        });
+        .and_then(|data| parse_opencode_model(&data));
 
     Ok(result)
+}
+
+/// Parse the model out of an OpenCode message `data` payload, supporting both
+/// the V2 shape (`model.id`) and the V1 shapes (`model.modelID` / `modelID`).
+fn parse_opencode_model(data: &str) -> Option<String> {
+    let json: serde_json::Value = serde_json::from_str(data).ok()?;
+    if let Some(model) = json
+        .get("model")
+        .and_then(|m| m.get("id"))
+        .and_then(|v| v.as_str())
+    {
+        return Some(model.to_string());
+    }
+    if let Some(model) = json
+        .get("model")
+        .and_then(|m| m.get("modelID"))
+        .and_then(|v| v.as_str())
+    {
+        return Some(model.to_string());
+    }
+    json.get("modelID")
+        .and_then(|v| v.as_str())
+        .map(String::from)
 }
 
 #[cfg(test)]
@@ -1454,6 +1487,43 @@ model = "profile-only-model"
         conn.execute_batch(
             "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT);
              INSERT INTO message VALUES ('msg-1', 'sess-1', 1000, 1000, '{\"role\":\"assistant\",\"modelID\":\"claude-opus-4-6\",\"providerID\":\"anthropic\"}');",
+        ).unwrap();
+        drop(conn);
+
+        let result = extract_model(&db_path, StreamFormat::OpenCodeSqlite, Some("sess-1")).unwrap();
+        assert_eq!(result, Some("claude-opus-4-6".to_string()));
+    }
+
+    #[test]
+    fn test_extract_model_opencode_v2_session_message() {
+        // OpenCode V2 moved messages to `session_message` and stores the model
+        // as `data.model.id`.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = crate::sqlite::open_with_memory_limits(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT);
+             INSERT INTO session_message VALUES ('m-0', 'sess-v2', 'user', 1, 1000, 1000, '{\"text\":\"hi\"}');
+             INSERT INTO session_message VALUES ('m-1', 'sess-v2', 'assistant', 2, 1001, 1001, '{\"agent\":\"build\",\"model\":{\"id\":\"deepseek-v4.1-flash\",\"providerID\":\"opencode-go\"}}');",
+        ).unwrap();
+        drop(conn);
+
+        let result = extract_model(&db_path, StreamFormat::OpenCodeSqlite, Some("sess-v2")).unwrap();
+        assert_eq!(result, Some("deepseek-v4.1-flash".to_string()));
+    }
+
+    #[test]
+    fn test_extract_model_opencode_v2_falls_back_to_v1_message_table() {
+        // A V2-shaped `session_message` table that has no model for this session
+        // must not shadow a matching V1 `message` row.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = crate::sqlite::open_with_memory_limits(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT);
+             INSERT INTO session_message VALUES ('m-1', 'sess-other', 'assistant', 1, 1000, 1000, '{\"model\":{\"id\":\"other-model\"}}');
+             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT);
+             INSERT INTO message VALUES ('msg-1', 'sess-1', 1000, 1000, '{\"role\":\"assistant\",\"modelID\":\"claude-opus-4-6\"}');",
         ).unwrap();
         drop(conn);
 

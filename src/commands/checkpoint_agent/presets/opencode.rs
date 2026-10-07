@@ -154,13 +154,23 @@ impl OpenCodePreset {
 
     fn lookup_parent_session(db_path: &Path, session_id: &str) -> Option<String> {
         let conn = crate::streams::agents::opencode::open_sqlite_readonly(db_path).ok()?;
+        // OpenCode V2 stores sessions in `session_v2`; older versions use `session`.
         conn.query_row(
-            "SELECT parent_id FROM session WHERE id = ?",
+            "SELECT parent_id FROM session_v2 WHERE id = ?",
             [session_id],
             |row| row.get::<_, Option<String>>(0),
         )
         .ok()
         .flatten()
+        .or_else(|| {
+            conn.query_row(
+                "SELECT parent_id FROM session WHERE id = ?",
+                [session_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+        })
     }
 
     fn opencode_data_path() -> Result<PathBuf, GitAiError> {
@@ -516,6 +526,54 @@ mod tests {
                 assert_eq!(e.tool_use_id, "bash");
             }
             _ => panic!("Expected PreBashCall"),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_opencode_extracts_model_from_v2_storage() {
+        // OpenCode V2 stores messages in `session_message` with the model at
+        // `data.model.id`; the preset must resolve it instead of "unknown".
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = crate::sqlite::open_with_memory_limits(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT);
+             INSERT INTO session_message VALUES ('m-1', 'sess-v2', 'assistant', 1, 1000, 1000, '{\"model\":{\"id\":\"deepseek-v4.1-flash\",\"providerID\":\"opencode-go\"}}');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let prev = std::env::var_os("GIT_AI_OPENCODE_STORAGE_PATH");
+        // SAFETY: serialized via #[serial_test::serial].
+        unsafe {
+            std::env::set_var("GIT_AI_OPENCODE_STORAGE_PATH", &db_path);
+        }
+
+        let input = json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "sess-v2",
+            "cwd": "/project",
+            "tool_name": "edit",
+            "tool_use_id": "tu-1",
+            "tool_input": {"file_path": "src/main.rs"}
+        })
+        .to_string();
+        let events = OpenCodePreset.parse(&input, "t_test").unwrap();
+
+        // SAFETY: serialized via #[serial_test::serial].
+        unsafe {
+            match prev {
+                Some(value) => std::env::set_var("GIT_AI_OPENCODE_STORAGE_PATH", value),
+                None => std::env::remove_var("GIT_AI_OPENCODE_STORAGE_PATH"),
+            }
+        }
+
+        match &events[0] {
+            ParsedHookEvent::PreFileEdit(e) => {
+                assert_eq!(e.context.agent_id.model, "deepseek-v4.1-flash");
+            }
+            _ => panic!("Expected PreFileEdit"),
         }
     }
 }
